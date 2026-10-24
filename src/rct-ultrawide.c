@@ -21,13 +21,16 @@
 #include <unistd.h>
 
 #define APP_NAME "rct-ultrawide"
-#define APP_VERSION "0.1.0"
+#define APP_VERSION "0.2.0"
 #define SUPPORTED_SHA256 "bdfebd64383b231de0252fe0726523d1c45aa2c4da919c2d7ed8bfb7aaa05c76"
 #define PE_IMAGE_BASE 0x00400000u
 #define CONFIG_SIZE 100u
 #define CONFIG_DISPLAY_MODE_OFFSET 23u
 #define PATCH_TIMEOUT_SECONDS 120
 #define POLL_INTERVAL_NS 20000000L
+#define MAX_DISPLAYS 32
+#define MAX_STEAM_LIBRARIES 32
+#define MAX_STEAM_CANDIDATES 16
 
 typedef struct {
     uint32_t state[8];
@@ -95,6 +98,15 @@ typedef enum {
     PATCH_SUCCESS,
     PATCH_FATAL
 } PatchResult;
+
+typedef struct {
+    char name[128];
+    uint32_t width;
+    uint32_t height;
+    long x;
+    long y;
+    bool primary;
+} DisplayInfo;
 
 static void sha256_transform(Sha256Context *ctx, const uint8_t block[64]) {
     uint32_t words[64];
@@ -451,24 +463,94 @@ static bool parse_dimensions(const char *text, uint32_t *width, uint32_t *height
     return true;
 }
 
-static bool detect_output_size(uint32_t *width, uint32_t *height) {
-    FILE *pipe = popen("xrandr --current 2>/dev/null", "r");
-    if (!pipe) return false;
-    char line[1024];
-    bool found = false;
-    while (fgets(line, sizeof(line), pipe)) {
-        char *current = strstr(line, " current ");
-        if (!current) continue;
-        unsigned w, h;
-        if (sscanf(current + 9, "%u x %u", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 32767 && h <= 32767) {
-            *width = w;
-            *height = h;
-            found = true;
-            break;
-        }
+static bool command_exists(const char *command);
+
+static bool parse_display_geometry(const char *text, uint32_t *width, uint32_t *height, long *x, long *y) {
+    unsigned parsed_width, parsed_height;
+    long parsed_x, parsed_y;
+    if (sscanf(text, "%ux%u%ld%ld", &parsed_width, &parsed_height, &parsed_x, &parsed_y) != 4 ||
+        parsed_width < 320 || parsed_height < 200 || parsed_width > 32767 || parsed_height > 32767)
+        return false;
+    *width = parsed_width;
+    *height = parsed_height;
+    *x = parsed_x;
+    *y = parsed_y;
+    return true;
+}
+
+/*
+ * Read active XRandR outputs rather than Screen 0's combined virtual desktop
+ * size. That prevents Gamescope from treating two side-by-side displays as a
+ * single very wide output. A selected zero-based index is passed to Gamescope;
+ * index correspondence across multiple active displays remains unverified.
+ */
+static bool query_displays(DisplayInfo displays[MAX_DISPLAYS], size_t *count,
+                           char *error, size_t error_size) {
+    *count = 0;
+    if (!command_exists("xrandr")) {
+        snprintf(error, error_size, "xrandr was not found in PATH");
+        return false;
     }
-    (void)pclose(pipe);
-    return found;
+    FILE *pipe = popen("xrandr --query 2>/dev/null", "r");
+    if (!pipe) {
+        snprintf(error, error_size, "cannot run xrandr: %s", strerror(errno));
+        return false;
+    }
+    char line[1024];
+    while (*count < MAX_DISPLAYS && fgets(line, sizeof(line), pipe)) {
+        char *connected = strstr(line, " connected");
+        if (!connected) continue;
+
+        size_t name_length = (size_t)(connected - line);
+        if (name_length == 0 || name_length >= sizeof(displays[0].name)) continue;
+        DisplayInfo parsed = {0};
+        memcpy(parsed.name, line, name_length);
+        parsed.name[name_length] = '\0';
+
+        char *cursor = connected + strlen(" connected");
+        while (isspace((unsigned char)*cursor)) ++cursor;
+        if (strncmp(cursor, "primary", 7) == 0 && isspace((unsigned char)cursor[7])) {
+            parsed.primary = true;
+            cursor += 7;
+            while (isspace((unsigned char)*cursor)) ++cursor;
+        }
+        char geometry[96];
+        size_t geometry_length = 0;
+        while (cursor[geometry_length] && !isspace((unsigned char)cursor[geometry_length]) &&
+               geometry_length + 1 < sizeof(geometry))
+            ++geometry_length;
+        if (geometry_length == 0) continue;
+        memcpy(geometry, cursor, geometry_length);
+        geometry[geometry_length] = '\0';
+        if (!parse_display_geometry(geometry, &parsed.width, &parsed.height, &parsed.x, &parsed.y)) continue;
+        displays[*count] = parsed;
+        ++*count;
+    }
+    int status = pclose(pipe);
+    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(error, error_size, "xrandr could not report active displays");
+        *count = 0;
+        return false;
+    }
+    if (*count == 0) {
+        snprintf(error, error_size, "xrandr found no connected display with an active mode");
+        return false;
+    }
+    return true;
+}
+
+static size_t primary_display_index(const DisplayInfo displays[MAX_DISPLAYS], size_t count) {
+    for (size_t i = 0; i < count; ++i)
+        if (displays[i].primary) return i;
+    return 0;
+}
+
+static void print_displays(FILE *stream, const DisplayInfo displays[MAX_DISPLAYS], size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        fprintf(stream, "  %zu: %s %ux%u at %+ld%+ld%s\n", i, displays[i].name,
+                displays[i].width, displays[i].height, displays[i].x, displays[i].y,
+                displays[i].primary ? " (primary)" : "");
+    }
 }
 
 static bool command_exists(const char *command) {
@@ -513,6 +595,116 @@ static bool shell_quote(const char *input, char output[PATH_MAX * 4]) {
     output[used++] = '\'';
     output[used] = '\0';
     return true;
+}
+
+static bool parse_vdf_value(const char *line, const char *key, char *value, size_t value_size) {
+    char token[96];
+    if (snprintf(token, sizeof(token), "\"%s\"", key) >= (int)sizeof(token)) return false;
+    const char *position = strstr(line, token);
+    if (!position) return false;
+    position += strlen(token);
+    while (isspace((unsigned char)*position)) ++position;
+    if (*position != '"') return false;
+    ++position;
+    size_t used = 0;
+    while (*position && *position != '"') {
+        char byte = *position++;
+        if (byte == '\\' && *position) byte = *position++;
+        if (used + 1 >= value_size) return false;
+        value[used++] = byte;
+    }
+    if (*position != '"') return false;
+    value[used] = '\0';
+    return true;
+}
+
+static bool add_unique_path(char paths[][PATH_MAX], size_t maximum, size_t *count, const char *path) {
+    if (!path || !*path || *count >= maximum) return false;
+    char canonical[PATH_MAX];
+    const char *stored = realpath(path, canonical) ? canonical : path;
+    if (strlen(stored) >= PATH_MAX) return false;
+    for (size_t i = 0; i < *count; ++i)
+        if (strcmp(paths[i], stored) == 0) return true;
+    memcpy(paths[*count], stored, strlen(stored) + 1);
+    ++*count;
+    return true;
+}
+
+static bool find_steam_game(char game_path[PATH_MAX], char *error, size_t error_size) {
+    char libraries[MAX_STEAM_LIBRARIES][PATH_MAX];
+    char candidates[MAX_STEAM_CANDIDATES][PATH_MAX];
+    size_t library_count = 0, candidate_count = 0;
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        snprintf(error, error_size, "HOME is not set; pass the full path to RCT.EXE");
+        return false;
+    }
+    char path[PATH_MAX];
+    static const char *home_suffixes[] = {
+        ".steam/steam", ".steam/root", ".steam/debian-installation", ".local/share/Steam"
+    };
+    for (size_t i = 0; i < sizeof(home_suffixes) / sizeof(home_suffixes[0]); ++i) {
+        if (snprintf(path, sizeof(path), "%s/%s", home, home_suffixes[i]) < (int)sizeof(path))
+            (void)add_unique_path(libraries, MAX_STEAM_LIBRARIES, &library_count, path);
+    }
+    const char *xdg_data_home = getenv("XDG_DATA_HOME");
+    if (xdg_data_home && *xdg_data_home &&
+        snprintf(path, sizeof(path), "%s/Steam", xdg_data_home) < (int)sizeof(path))
+        (void)add_unique_path(libraries, MAX_STEAM_LIBRARIES, &library_count, path);
+
+    for (size_t i = 0; i < library_count; ++i) {
+        char folders_path[PATH_MAX];
+        if (snprintf(folders_path, sizeof(folders_path), "%s/steamapps/libraryfolders.vdf", libraries[i]) >=
+            (int)sizeof(folders_path)) continue;
+        FILE *folders = fopen(folders_path, "r");
+        if (!folders) continue;
+        char line[2048], library_path[PATH_MAX];
+        while (fgets(line, sizeof(line), folders)) {
+            if (parse_vdf_value(line, "path", library_path, sizeof(library_path)))
+                (void)add_unique_path(libraries, MAX_STEAM_LIBRARIES, &library_count, library_path);
+        }
+        fclose(folders);
+    }
+
+    for (size_t i = 0; i < library_count; ++i) {
+        char manifest_path[PATH_MAX], install_directory[PATH_MAX];
+        if (snprintf(manifest_path, sizeof(manifest_path), "%s/steamapps/appmanifest_285310.acf", libraries[i]) >=
+            (int)sizeof(manifest_path)) continue;
+        FILE *manifest = fopen(manifest_path, "r");
+        if (!manifest) continue;
+        bool found_directory = false;
+        char line[2048];
+        while (fgets(line, sizeof(line), manifest)) {
+            if (parse_vdf_value(line, "installdir", install_directory, sizeof(install_directory))) {
+                found_directory = true;
+                break;
+            }
+        }
+        fclose(manifest);
+        if (!found_directory || !*install_directory || strchr(install_directory, '/') ||
+            strcmp(install_directory, ".") == 0 || strcmp(install_directory, "..") == 0)
+            continue;
+        char executable[PATH_MAX], canonical[PATH_MAX];
+        if (snprintf(executable, sizeof(executable), "%s/steamapps/common/%s/RCT.EXE",
+                     libraries[i], install_directory) >= (int)sizeof(executable) ||
+            !realpath(executable, canonical))
+            continue;
+        (void)add_unique_path(candidates, MAX_STEAM_CANDIDATES, &candidate_count, canonical);
+    }
+
+    if (candidate_count == 1) {
+        memcpy(game_path, candidates[0], strlen(candidates[0]) + 1);
+        return true;
+    }
+    if (candidate_count == 0) {
+        snprintf(error, error_size,
+                 "Steam App 285310 was not found in the standard Steam libraries; pass the full path to RCT.EXE");
+        return false;
+    }
+    snprintf(error, error_size,
+             "found multiple Steam installs for App 285310 (including '%.*s' and '%.*s'); pass the intended RCT.EXE path",
+             140, candidates[0], 140, candidates[1]);
+    return false;
 }
 
 static bool find_game_argument(char *const command[], char game_path[PATH_MAX], char *error, size_t error_size) {
@@ -796,7 +988,7 @@ static int game_exit_code(int status) {
 }
 
 static int run_game(const char *game_path, char *const game_command[], uint32_t output_width,
-                    uint32_t output_height, unsigned refresh) {
+                    uint32_t output_height, unsigned refresh, int display_index) {
     if (!command_exists("gamescope")) {
         fprintf(stderr, "%s: Gamescope was not found in PATH. Install Gamescope, then retry.\n", APP_NAME);
         return 1;
@@ -811,16 +1003,18 @@ static int run_game(const char *game_path, char *const game_command[], uint32_t 
         return 1;
     }
 
-    char game_width_text[16], game_height_text[16], output_width_text[16], output_height_text[16], refresh_text[16];
+    char game_width_text[16], game_height_text[16], output_width_text[16], output_height_text[16];
+    char refresh_text[16], display_index_text[16];
     snprintf(game_width_text, sizeof(game_width_text), "%u", game_width);
     snprintf(game_height_text, sizeof(game_height_text), "%u", game_height);
     snprintf(output_width_text, sizeof(output_width_text), "%u", output_width);
     snprintf(output_height_text, sizeof(output_height_text), "%u", output_height);
     snprintf(refresh_text, sizeof(refresh_text), "%u", refresh);
+    snprintf(display_index_text, sizeof(display_index_text), "%d", display_index);
 
     size_t command_count = 0;
     while (game_command[command_count]) ++command_count;
-    size_t fixed_count = refresh ? 20u : 18u;
+    size_t fixed_count = 22u + (refresh ? 2u : 0u) + (display_index >= 0 ? 2u : 0u);
     char **args = calloc(fixed_count + command_count + 1, sizeof(char *));
     if (!args) {
         fprintf(stderr, "%s: out of memory building Gamescope command.\n", APP_NAME);
@@ -835,6 +1029,10 @@ static int run_game(const char *game_path, char *const game_command[], uint32_t 
     args[n++] = (char *)"-S"; args[n++] = (char *)"integer";
     args[n++] = (char *)"-F"; args[n++] = (char *)"nearest";
     if (refresh) { args[n++] = (char *)"-r"; args[n++] = refresh_text; }
+    if (display_index >= 0) {
+        args[n++] = (char *)"--display-index";
+        args[n++] = display_index_text;
+    }
     args[n++] = (char *)"-f";
     args[n++] = (char *)"--force-grab-cursor";
     args[n++] = (char *)"--force-windows-fullscreen";
@@ -842,8 +1040,11 @@ static int run_game(const char *game_path, char *const game_command[], uint32_t 
     for (size_t i = 0; i < command_count; ++i) args[n++] = game_command[i];
     args[n] = NULL;
 
-    printf("Starting %ux%u inside Gamescope at %ux%u output (%ux integer scale).\n",
+    printf("Starting %ux%u inside Gamescope at %ux%u output (%ux integer scale)",
            game_width, game_height, output_width, output_height, scale);
+    if (display_index >= 0) printf(" on display index %d", display_index);
+    putchar('.');
+    putchar('\n');
     fflush(stdout);
     pid_t child = fork();
     if (child < 0) {
@@ -865,7 +1066,8 @@ static int run_game(const char *game_path, char *const game_command[], uint32_t 
         pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) {
             fprintf(stderr, "%s: game command exited before its runtime patch could be confirmed.\n", APP_NAME);
-            return game_exit_code(status);
+            int child_code = game_exit_code(status);
+            return child_code == 0 ? 1 : child_code;
         }
         if (waited < 0 && errno != EINTR) {
             fprintf(stderr, "%s: could not monitor Gamescope: %s\n", APP_NAME, strerror(errno));
@@ -911,14 +1113,17 @@ static void print_usage(FILE *stream, const char *program) {
         "%s %s — guarded Linux launcher patch for RollerCoaster Tycoon Deluxe\n\n"
         "Usage:\n"
         "  %s doctor <path/to/RCT.EXE>\n"
+        "  %s displays\n"
+        "  %s install [path/to/RCT.EXE] [--launcher <path>] [--prefix <existing-prefix>]\n"
+        "  %s uninstall [path/to/RCT.EXE]\n"
         "  %s configure <path/to/RCT.EXE> [--launcher <path/to/rct-ultrawide>]\n"
         "  %s restore <path/to/RCT.EXE>\n"
-        "  %s run [--output WIDTHxHEIGHT] [--refresh HZ] -- <Steam %%command%%>\n"
+        "  %s run [--monitor INDEX] [--output WIDTHxHEIGHT] [--refresh HZ] -- <Steam %%command%%>\n"
         "  %s --version\n\n"
         "Steam Launch Options:\n"
         "  \"/path/to/rct-ultrawide\" run -- %%command%%\n\n"
         "Only the listed RCT Deluxe executable build is supported. The original EXE is never modified.\n",
-        APP_NAME, APP_VERSION, program, program, program, program, program);
+        APP_NAME, APP_VERSION, program, program, program, program, program, program, program, program);
 }
 
 static int command_doctor(const char *input_path) {
@@ -943,17 +1148,37 @@ static int command_doctor(const char *input_path) {
     printf("Executable: %s\n", game_path);
     printf("Game.cfg: %s (windowed flag: %u)\n", config_path, config[CONFIG_DISPLAY_MODE_OFFSET]);
     struct stat st;
-    if (lstat(backup_path, &st) == 0)
-        printf("Backup: %s\n", backup_path);
-    else
+    if (lstat(backup_path, &st) == 0) {
+        uint8_t backup[CONFIG_SIZE];
+        char backup_error[256] = {0};
+        if (S_ISREG(st.st_mode) && read_config(backup_path, backup, NULL, backup_error, sizeof(backup_error)))
+            printf("Backup: valid (%s; backed-up display-mode flag %u)\n", backup_path,
+                   backup[CONFIG_DISPLAY_MODE_OFFSET]);
+        else
+            printf("Backup: invalid or unreadable (%s%s%s)\n", backup_path,
+                   backup_error[0] ? ": " : "", backup_error);
+    } else {
         printf("Backup: not created yet\n");
-    uint32_t width, height;
-    if (detect_output_size(&width, &height))
-        printf("Detected X display: %ux%u\n", width, height);
-    else
-        printf("Detected X display: unavailable (run accepts --output WIDTHxHEIGHT)\n");
+    }
+    DisplayInfo displays[MAX_DISPLAYS];
+    size_t display_count;
+    char display_error[256] = {0};
+    if (query_displays(displays, &display_count, display_error, sizeof(display_error))) {
+        printf("Active XRandR displays (default: index %zu):\n", primary_display_index(displays, display_count));
+        print_displays(stdout, displays, display_count);
+    } else {
+        printf("Display detection: unavailable (%s); run accepts --output WIDTHxHEIGHT\n", display_error);
+    }
     if (command_exists("gamescope")) printf("Gamescope: available\n");
     else printf("Gamescope: not found in PATH\n");
+    if (getenv("DISPLAY") && *getenv("DISPLAY"))
+        printf("X11 DISPLAY: %s\n", getenv("DISPLAY"));
+    else
+        printf("X11 DISPLAY: not set\n");
+    if (getenv("STEAM_COMPAT_DATA_PATH") && *getenv("STEAM_COMPAT_DATA_PATH"))
+        printf("Steam Proton prefix: available in this process environment\n");
+    else
+        printf("Steam Proton prefix: not set (normal when doctor is run outside Steam)\n");
     return 0;
 }
 
@@ -963,21 +1188,30 @@ static int command_configure(const char *input_path, const char *launcher_path) 
         fprintf(stderr, "%s: %s\n", APP_NAME, error);
         return 1;
     }
-    if (!configure_game(game_path, true, error, sizeof(error))) {
-        fprintf(stderr, "%s: %s\n", APP_NAME, error);
-        return 1;
-    }
+    char quoted[PATH_MAX * 4];
     if (launcher_path) {
         char resolved[PATH_MAX];
         if (!realpath(launcher_path, resolved)) {
             fprintf(stderr, "%s: cannot resolve launcher '%s': %s\n", APP_NAME, launcher_path, strerror(errno));
             return 1;
         }
-        char quoted[PATH_MAX * 4];
+        struct stat launcher_stat;
+        if (stat(resolved, &launcher_stat) != 0 || !S_ISREG(launcher_stat.st_mode) || access(resolved, X_OK) != 0) {
+            fprintf(stderr, "%s: launcher '%s' is not a regular executable file.\n", APP_NAME, resolved);
+            return 1;
+        }
         if (!shell_quote(resolved, quoted)) {
             fprintf(stderr, "%s: launcher path is too long to quote.\n", APP_NAME);
             return 1;
         }
+    } else {
+        strcpy(quoted, "\"/absolute/path/to/rct-ultrawide\"");
+    }
+    if (!configure_game(game_path, true, error, sizeof(error))) {
+        fprintf(stderr, "%s: %s\n", APP_NAME, error);
+        return 1;
+    }
+    if (launcher_path) {
         printf("Steam Launch Options:\n%s run -- %%command%%\n", quoted);
     } else {
         printf("Set this in Steam > Properties > Launch Options:\n\"/absolute/path/to/rct-ultrawide\" run -- %%command%%\n");
@@ -985,15 +1219,146 @@ static int command_configure(const char *input_path, const char *launcher_path) 
     return 0;
 }
 
+static int command_install(int argc, char **argv) {
+    const char *input_path = NULL, *launcher_path = NULL, *prefix = NULL;
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--launcher") == 0 && i + 1 < argc) {
+            launcher_path = argv[++i];
+        } else if (strcmp(argv[i], "--prefix") == 0 && i + 1 < argc) {
+            prefix = argv[++i];
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "%s: unknown install option '%s'.\n", APP_NAME, argv[i]);
+            return 2;
+        } else if (!input_path) {
+            input_path = argv[i];
+        } else {
+            fprintf(stderr, "%s: install accepts one RCT.EXE path.\n", APP_NAME);
+            return 2;
+        }
+    }
+    if (prefix && (strchr(prefix, '\n') || strchr(prefix, '\r') || strstr(prefix, "%command%"))) {
+        fprintf(stderr, "%s: --prefix must be one line of existing Steam prefixes and must omit %%command%%.\n",
+                APP_NAME);
+        return 2;
+    }
+    char discovered_path[PATH_MAX];
+    if (!input_path) {
+        char find_error[512] = {0};
+        if (!find_steam_game(discovered_path, find_error, sizeof(find_error))) {
+            fprintf(stderr, "%s: %s\n", APP_NAME, find_error);
+            return 1;
+        }
+        input_path = discovered_path;
+        printf("Found Steam App 285310 at %s\n", input_path);
+    }
+    char game_path[PATH_MAX], error[512] = {0};
+    if (!validate_supported_game(input_path, game_path, error, sizeof(error))) {
+        fprintf(stderr, "%s: %s\n", APP_NAME, error);
+        return 1;
+    }
+    char quoted_launcher[PATH_MAX * 4];
+    if (launcher_path) {
+        char resolved[PATH_MAX];
+        struct stat launcher_stat;
+        if (!realpath(launcher_path, resolved)) {
+            fprintf(stderr, "%s: launcher '%s' is missing or not executable: %s\n",
+                    APP_NAME, launcher_path, strerror(errno));
+            return 1;
+        }
+        if (stat(resolved, &launcher_stat) != 0) {
+            fprintf(stderr, "%s: cannot inspect launcher '%s': %s\n", APP_NAME, resolved, strerror(errno));
+            return 1;
+        }
+        if (!S_ISREG(launcher_stat.st_mode) || access(resolved, X_OK) != 0) {
+            fprintf(stderr, "%s: launcher '%s' is not a regular executable file.\n", APP_NAME, resolved);
+            return 1;
+        }
+        if (!shell_quote(resolved, quoted_launcher)) {
+            fprintf(stderr, "%s: launcher path is too long to quote.\n", APP_NAME);
+            return 1;
+        }
+    } else {
+        strcpy(quoted_launcher, "\"/absolute/path/to/rct-ultrawide\"");
+    }
+    if (!configure_game(game_path, true, error, sizeof(error))) {
+        fprintf(stderr, "%s: %s\n", APP_NAME, error);
+        return 1;
+    }
+    printf("\nPaste this into Steam > RollerCoaster Tycoon Deluxe > Properties > Launch Options:\n");
+    if (prefix && *prefix) printf("%s ", prefix);
+    printf("%s run -- %%command%%\n", quoted_launcher);
+    printf("Steam settings were not edited. Keep any existing environment or performance prefix before the command above.\n");
+    return 0;
+}
+
+static int command_uninstall(int argc, char **argv) {
+    if (argc > 3) { print_usage(stderr, argv[0]); return 2; }
+    char discovered_path[PATH_MAX];
+    const char *input_path = argc == 3 ? argv[2] : NULL;
+    if (!input_path) {
+        char find_error[512] = {0};
+        if (!find_steam_game(discovered_path, find_error, sizeof(find_error))) {
+            fprintf(stderr, "%s: %s\n", APP_NAME, find_error);
+            return 1;
+        }
+        input_path = discovered_path;
+        printf("Found Steam App 285310 at %s\n", input_path);
+    }
+    char game_path[PATH_MAX], error[512] = {0};
+    if (!validate_supported_game(input_path, game_path, error, sizeof(error))) {
+        fprintf(stderr, "%s: %s\n", APP_NAME, error);
+        return 1;
+    }
+    if (!restore_game_config(game_path, error, sizeof(error))) {
+        fprintf(stderr, "%s: %s\n", APP_NAME, error);
+        return 1;
+    }
+    printf("Remove only the rct-ultrawide command from Steam Launch Options; keep any prefixes that were already there.\n");
+    return 0;
+}
+
+static int command_displays(void) {
+    DisplayInfo displays[MAX_DISPLAYS];
+    size_t display_count;
+    char error[256] = {0};
+    if (!query_displays(displays, &display_count, error, sizeof(error))) {
+        fprintf(stderr, "%s: %s\n", APP_NAME, error);
+        return 1;
+    }
+    printf("Active displays (use the index with run --monitor INDEX):\n");
+    print_displays(stdout, displays, display_count);
+    return 0;
+}
+
+static bool parse_monitor_index(const char *text, int *index) {
+    if (!text || !*text || text[0] == '-') return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || !end || *end || value >= MAX_DISPLAYS) return false;
+    *index = (int)value;
+    return true;
+}
+
 static int command_run(int argc, char **argv) {
     uint32_t output_width = 0, output_height = 0;
     unsigned refresh = 0;
+    bool output_supplied = false;
+    int display_index = -1;
     int separator = -1;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--") == 0) { separator = i; break; }
         if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             if (!parse_dimensions(argv[++i], &output_width, &output_height)) {
                 fprintf(stderr, "%s: invalid output size; use WIDTHxHEIGHT, such as 3440x1440.\n", APP_NAME);
+                return 2;
+            }
+            output_supplied = true;
+        } else if ((strcmp(argv[i], "--monitor") == 0 || strcmp(argv[i], "--display-index") == 0) &&
+                   i + 1 < argc) {
+            if (!parse_monitor_index(argv[++i], &display_index)) {
+                fprintf(stderr, "%s: monitor index must be a number from 0 to %u.\n",
+                        APP_NAME, MAX_DISPLAYS - 1);
                 return 2;
             }
         } else if (strcmp(argv[i], "--refresh") == 0 && i + 1 < argc) {
@@ -1019,15 +1384,32 @@ static int command_run(int argc, char **argv) {
         fprintf(stderr, "%s: %s\n", APP_NAME, error);
         return 1;
     }
-    if (output_width == 0 && !detect_output_size(&output_width, &output_height)) {
-        fprintf(stderr, "%s: could not detect the active display with xrandr; pass --output WIDTHxHEIGHT.\n", APP_NAME);
-        return 1;
+    if (!output_supplied || display_index >= 0) {
+        DisplayInfo displays[MAX_DISPLAYS];
+        size_t display_count;
+        char display_error[256] = {0};
+        if (!query_displays(displays, &display_count, display_error, sizeof(display_error))) {
+            fprintf(stderr, "%s: %s; pass --output WIDTHxHEIGHT and avoid --monitor if no XRandR output is available.\n",
+                    APP_NAME, display_error);
+            return 1;
+        }
+        size_t selected = display_index >= 0 ? (size_t)display_index : primary_display_index(displays, display_count);
+        if (selected >= display_count) {
+            fprintf(stderr, "%s: monitor index %zu is not active; available displays are:\n", APP_NAME, selected);
+            print_displays(stderr, displays, display_count);
+            return 2;
+        }
+        if (!output_supplied) {
+            output_width = displays[selected].width;
+            output_height = displays[selected].height;
+        }
+        if (display_index < 0) display_index = (int)selected;
     }
     if (output_width < 320 || output_height < 200 || output_width > 32767 || output_height > 32767) {
         fprintf(stderr, "%s: output dimensions are outside the supported range.\n", APP_NAME);
         return 2;
     }
-    return run_game(game_path, game_command, output_width, output_height, refresh);
+    return run_game(game_path, game_command, output_width, output_height, refresh, display_index);
 }
 
 int main(int argc, char **argv) {
@@ -1047,6 +1429,12 @@ int main(int argc, char **argv) {
         if (argc != 3) { print_usage(stderr, argv[0]); return 2; }
         return command_doctor(argv[2]);
     }
+    if (strcmp(argv[1], "displays") == 0) {
+        if (argc != 2) { print_usage(stderr, argv[0]); return 2; }
+        return command_displays();
+    }
+    if (strcmp(argv[1], "install") == 0) return command_install(argc, argv);
+    if (strcmp(argv[1], "uninstall") == 0) return command_uninstall(argc, argv);
     if (strcmp(argv[1], "configure") == 0) {
         const char *launcher = NULL;
         if (argc == 3) return command_configure(argv[2], NULL);
