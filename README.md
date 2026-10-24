@@ -31,6 +31,14 @@ make release
 
 This creates `build/rct-ultrawide-linux-x86_64` and a SHA-256 checksum file.
 
+To run the regression suite used in CI:
+
+```sh
+make test
+```
+
+The suite uses disposable fixtures and stub display/Gamescope commands. It checks Steam library discovery, selected-display Gamescope arguments, config backup and restoration, and refusal of an unsupported executable. It does not include or need the game's files.
+
 ## Guided installation for Steam
 
 Run `install` from a terminal. It finds a unique Steam App 285310 installation in the standard Steam libraries, verifies the executable, backs up `Data/Game.cfg` once, and selects the windowed renderer:
