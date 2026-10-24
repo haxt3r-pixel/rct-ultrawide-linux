@@ -1,0 +1,24 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile static x86-64 executable
+        run: make release
+      - name: Verify ELF architecture and static linkage
+        run: |
+          file build/rct-ultrawide-linux-x86_64
+          if readelf -l build/rct-ultrawide-linux-x86_64 | grep -q INTERP; then
+            echo "Expected a self-contained static executable" >&2
+            exit 1
+          fi

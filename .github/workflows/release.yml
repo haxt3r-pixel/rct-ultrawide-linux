@@ -1,0 +1,26 @@
+name: Release Linux executable
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release executable and checksum
+        run: make release
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            build/rct-ultrawide-linux-x86_64 \
+            build/rct-ultrawide-linux-x86_64.sha256 \
+            --title "RCT Ultrawide ${GITHUB_REF_NAME}" \
+            --generate-notes
